@@ -365,7 +365,9 @@ class NV_GSP(NV_IP):
     # Alloc queues
     pte_cnt = ((queue_pte_cnt:=(queue_size * 2) // 0x1000)) + round_up(queue_pte_cnt * 8, 0x1000) // 0x1000
     pt_size = round_up(pte_cnt * 8, 0x1000)
-    queues_view, _, queues_sysmem = self.nvdev._alloc_boot_mem(pt_size + queue_size * 2, sysmem=True)
+    # over usb the only sysmem is the bridge's 512kb sram, so the queues go in vram, which gsp reaches through bar1 like the other boot mem
+    in_sysmem = None if self.nvdev.devfmt.startswith("usb:") else True
+    queues_view, _, queues_sysmem = self.nvdev._alloc_boot_mem(pt_size + queue_size * 2, sysmem=in_sysmem)
 
     # Fill up ptes
     for i, sysmem in enumerate(queues_sysmem): queues_view.view(i * 0x8, 0x8, fmt='Q')[0] = sysmem

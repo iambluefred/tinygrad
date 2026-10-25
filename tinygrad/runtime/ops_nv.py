@@ -4,13 +4,14 @@ from typing import Any
 from dataclasses import dataclass, replace
 from tinygrad.runtime.support.hcq2 import HWQueue, patch, to_name, unwrap_view, make_submit, timeline, HCQInfo, lower_call, hcq_link
 from tinygrad.runtime.support.hcq2 import layout_args, make_program, ins
-from tinygrad.runtime.support.memory import MMIOInterface, BumpAllocator
-from tinygrad.runtime.support.system import FileIOInterface, filter_visible_devices, PCIIfaceBase, MAP_FIXED
+from tinygrad.runtime.support.memory import MMIOInterface, BumpAllocator, AddrSpace as MemSpace
+from tinygrad.runtime.support.system import FileIOInterface, filter_visible_devices, PCIIfaceBase, USBPCIDevice, MAP_FIXED
+from tinygrad.runtime.support.usb import USB3, setup_usb_rules
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo, uopfunc
 from tinygrad.engine.realize import get_call_arg_uops, get_call_kernel_args, lower_and_compile, run_linear
 from tinygrad.device import BufferStorage, Buffer, BufferSpec, Allocator, Compiled, Device, TinyELF
 from tinygrad.dtype import dtypes, DType, AddrSpace
-from tinygrad.helpers import getenv, mv_address, round_up, data64, data64_le, prod, OSX, PROFILE, ContextVar, VIZ, ProfileEvent, unwrap
+from tinygrad.helpers import getenv, mv_address, round_up, data64, data64_le, prod, OSX, PROFILE, ContextVar, VIZ, ProfileEvent, unwrap, pluralize
 from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.renderer.cstyle import CUDARenderer, NVCCRenderer
 from tinygrad.runtime.autogen import nv_570, nv_580, nv_610, nv_615, mesa
@@ -108,14 +109,18 @@ class NVQueue(HWQueue):
 
   def nvm(self, subc:int, mthd:int|UOp, *vals, typ=2): self.q(*nvm(subc, mthd, *vals, typ=typ))
 
-  def sem(self, addr:UOp, value:UOp, **flags:str):
-    self.nvm(0, nv_gpu.NVC56F_SEM_ADDR_LO, addr, value.ccast(dtypes.uint64), nv_flags("NVC56F_SEM_EXECUTE", payload_size="64bit", **flags))
+  def sem(self, addr:UOp, value:UOp, payload_size="64bit", **flags:str):
+    self.nvm(0, nv_gpu.NVC56F_SEM_ADDR_LO, addr, value.ccast(dtypes.uint64), nv_flags("NVC56F_SEM_EXECUTE", payload_size=payload_size, **flags))
 
-  def wait(self, signal:UOp, value:UOp): self.sem(signal.getaddr(self.devs), value, operation="acq_circ_geq")
+  # timelines are 64 bit, the usb link's words (fence, go, sentinels) are 32 bit
+  def width(self, signal:UOp, eq:bool=False) -> str: return "32bit" if eq or signal.dtype.itemsize < 8 else "64bit"
+  def wait(self, signal:UOp, value:UOp, eq:bool=False):
+    self.sem(signal.getaddr(self.devs), value, self.width(signal, eq), operation="acquire" if eq else "acq_circ_geq")
   def signal(self, signal:UOp, value:UOp): self.release(signal, value)
   def timestamp(self, signal:UOp): self.release(signal, UOp.const(0, dtypes.uint64), timestamp=True)
   def release(self, signal:UOp, value:UOp, timestamp:bool=False):
-    self.sem(signal.getaddr(self.devs), value, operation="release", release_wfi="en", release_timestamp="en" if timestamp else "dis")
+    self.sem(signal.getaddr(self.devs), value, "64bit" if timestamp else self.width(signal), operation="release", release_wfi="en",
+             release_timestamp="en" if timestamp else "dis")
     if not timestamp: self.nvm(0, nv_gpu.NVC56F_NON_STALL_INTERRUPT, 0x0)
 
   def submit(self, cmdbuf:UOp) -> UOp:
@@ -136,12 +141,13 @@ class NVComputeQueue(NVQueue):
     self.qmds:list[QMD] = []
     self.prev_qmd:QMD|None = None # the launch the next one chains onto
 
-  def wait(self, signal:UOp, value:UOp):
+  def wait(self, signal:UOp, value:UOp, eq:bool=False):
     self.prev_qmd = None
-    super().wait(signal, value)
+    super().wait(signal, value, eq)
 
   def release(self, signal:UOp, value:UOp, timestamp:bool=False):
-    if self.prev_qmd is None or not self.prev_qmd.set_release(signal.getaddr(self.devs), value, timestamp):
+    if self.prev_qmd is None or (not timestamp and self.width(signal) != "64bit") or \
+       not self.prev_qmd.set_release(signal.getaddr(self.devs), value, timestamp):
       self.prev_qmd = None
       super().release(signal, value, timestamp)
 
@@ -528,7 +534,9 @@ class PCIIface(PCIIfaceBase):
     if NVKIface.root is not None: raise RuntimeError("Cannot use PCIIface after NVKIface has been initialized (would corrupt UVM memory)")
     super().__init__(dev, dev_id, vendor=0x10de, devices=((0xff00, (0x2200,0x2400,0x2500,0x2600,0x2700,0x2800,0x2b00,0x2c00,0x2d00,0x2f00)),),
       base_class=0x03, vram_bar=1, va_start=NVMemoryManager.va_allocator.base, va_size=NVMemoryManager.va_allocator.size, dev_impl_t=NVDev)
+    self._init_rm()
 
+  def _init_rm(self):
     self.root, self.gpu_instance = 0xc1000000, 0
     self.rm_alloc(0, nv_gpu.NV01_ROOT, nv_gpu.NV0000_ALLOC_PARAMETERS())
 
@@ -549,6 +557,32 @@ class PCIIface(PCIIfaceBase):
     for _ in self.dev_impl.gsp.stat_q.read_resp(): pass
     if self.dev_impl.is_err_state: raise RuntimeError("Device fault detected")
 
+class USBAllocator(NVAllocator): # the host program reads another device's memory in place: its bytes are the mapping
+  def _map(self, buf:Buffer) -> BufferStorage: return BufferStorage(buf.host.addr, buf.host.mv)
+  def _unmap(self, mapping:BufferStorage): pass
+
+class USBIface(PCIIface):
+  def __init__(self, dev, dev_id): # pylint: disable=super-init-not-called
+    if dev_id >= len(visible:=filter_visible_devices(USB3.list_devices(0xADD1, 0x0001) + USB3.list_devices(0x3801, 0x0001), "NV")):
+      raise RuntimeError(f"NV:{dev_id} does not exist ({pluralize('device', len(visible))} available)")
+    usbdev, pcibus = visible[dev_id]
+    self.dev, self.pci_dev, self.vram_bar, self.count = dev, USBPCIDevice("NV", usbdev, pcibus, vendor=0x10de), 1, len(visible)
+    self.dev_impl = NVDev(self.pci_dev)
+    self._init_rm()
+
+  @functools.cached_property
+  def ctrl(self) -> Buffer: # same layout as amd's, usb.py slices it: the sys page at 0, the cq page at 0x1000, the sram at 0x5000
+    vaddr, pieces = self.dev_impl.mm.alloc_vaddr(size=0x85000), [(0x0, 0x820000, 0x1000), (0x1000, 0x822000, 0x1000), (0x5000, 0x200000, 0x80000)]
+    for off, paddr, n in pieces: self.dev_impl.mm.map_range(vaddr + off, n, [(paddr, n)], aspace=MemSpace.SYS, uncached=True)
+    view = self.pci_dev.dma_view(0xa000, 0x85000)
+    for off, n in ((0x800, 4), (0x5000, 0x80000)): view.view(off, n)[:] = bytes(n) # no stale fence or sentinel
+    return Buffer(self.dev.device, 0x85000, options=BufferSpec(external_ptr=vaddr), opaque=BufferStorage(vaddr, host=view))
+
+  def alloc(self, size:int, host=False, uncached=False, cpu_access=False, contiguous=False, force_devmem=False, zero=False,
+            **kwargs) -> BufferStorage:
+    # everything lives in vram: the bridge's sram is the usb staging window
+    return super().alloc(size, host=False, uncached=uncached, cpu_access=cpu_access or host, contiguous=contiguous, force_devmem=True, **kwargs)
+
 class MOCKIface(NVKIface): count = 1
 
 Compiled.pm_encode += PatternMatcher([
@@ -558,13 +592,14 @@ Compiled.pm_encode += PatternMatcher([
 ])
 
 class NVDevice(Compiled):
-  ifaces = [NVKIface, PCIIface, MOCKIface]
+  ifaces = [NVKIface, PCIIface, USBIface, MOCKIface]
   sleep_timeout_ms = 200
 
   def is_nvd(self) -> bool: return isinstance(self.iface, PCIIface)
 
   def __init__(self, device:str=""):
     self.iface = self._select_iface(device)
+    self.is_usb = isinstance(self.iface, USBIface)
 
     device_params = nv_gpu.NV0080_ALLOC_PARAMETERS(deviceId=self.iface.gpu_instance, hClientShare=self.iface.root,
                                                    vaMode=nv_gpu.NV_DEVICE_ALLOCATION_VAMODE_OPTIONAL_MULTIPLE_VASPACES)
@@ -601,7 +636,9 @@ class NVDevice(Compiled):
     # Set windows addresses to not collide with other allocated buffers.
     self.shared_mem_window, self.local_mem_window = 0x729400000000, 0x729300000000
 
-    super().__init__(device, NVAllocator(self), [CUDARenderer, PTXRenderer, NVCCRenderer, NAKRenderer], None, arch=self.arch)
+    super().__init__(device, USBAllocator(self) if self.is_usb else NVAllocator(self), [CUDARenderer, PTXRenderer, NVCCRenderer, NAKRenderer], None,
+                     arch=self.arch)
+    if self.is_usb: setup_usb_rules(self)
 
     self.pma_enabled, self.pma_exec_counter = PMA.value > 0 and PROFILE >= 1, itertools.count(0)
 

@@ -128,6 +128,8 @@ class NVDev:
 
     self.vram, self.mmio = self.pci_dev.map_bar(1), self.pci_dev.map_bar(0, fmt='I')
     self.large_bar = self.vram.nbytes >= self.vram_size
+    if self.devfmt.startswith("usb:") and not self.large_bar:
+      raise RuntimeError(f"nv {self.devfmt}: bar1 is {self.vram.nbytes:#x}, smaller than vram {self.vram_size:#x}. usb needs resizable bar")
 
     # UVM depth   HW level                            VA bits
     # 0           PDE4                                56:56 (hopper+)
